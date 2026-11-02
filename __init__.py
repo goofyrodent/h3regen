@@ -275,6 +275,71 @@ class OpenH3RegenLora:
                "invert": "model time read back from the model's own curve, branches use the reference curve",
                "recorded": "full (non-pruned) model, model time recorded from the time embedder"}[mode]
         return f"Sharp curve branches: {len(blocks)} at {strength:g}, {tag}; {how}"
+class OpenH3RegenSharpCurves:
+    """Apply LMS Sharp curve branches without loading the merged LoRA."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        loras = folder_paths.get_filename_list("loras")
+        checkpoints = folder_paths.get_filename_list("diffusion_models")
+
+        return {
+            "required": {
+                "model": ("MODEL",),
+
+                "curve_name": (loras, {
+                    "default": _pick(loras, "sharp_curve_branches"),
+                }),
+
+                "curve_table": ([OWN_TABLE] + checkpoints, {
+                    "default": _pick(
+                        checkpoints,
+                        "ref2va_pruned_int8_convrot",
+                        "ref2va_pruned"
+                    ) or OWN_TABLE,
+                }),
+
+                "curve_strength": ("FLOAT", {
+                    "default": 1.0,
+                    "min": -2.0,
+                    "max": 2.0,
+                    "step": 0.01,
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "report")
+    FUNCTION = "apply"
+    CATEGORY = CATEGORY
+
+    DESCRIPTION = (
+        "Applies LMS Sharp curve branches only. "
+        "Ordinary LoRAs must already be applied upstream."
+    )
+
+    def apply(self, model, curve_name, curve_table, curve_strength):
+
+        if curve_strength == 0:
+            return (model, "Sharp curve branches disabled")
+
+        if "sharp_curve_branches" not in curve_name.lower():
+            raise ValueError(
+                "Select sharp_curve_branches.safetensors"
+            )
+
+        patched_model = model.clone()
+
+        report = OpenH3RegenLora._apply_curves(
+            patched_model,
+            curve_name,
+            curve_table,
+            curve_strength
+        )
+
+        LOG.info(report)
+
+        return (patched_model, report)
 
 
 # ------------------------------------------------------------------ sigmas
@@ -551,7 +616,7 @@ class OpenH3RegenFastVAEDecode:
         images = vae.decode(samples["samples"])
         return (images.reshape(-1, *images.shape[-3:]) if images.ndim == 5 else images,)
 
-    def decode(self, samples, vae_name, keep_loaded, vae=None):
+    def decode(self, samples, vae_name, keep_loaded, spatial_batch, vae=None):
         model = _fast_vae(folder_paths.get_full_path_or_raise("vae", vae_name))
         z = samples["samples"]
         z = z.tensors[0] if _nested(z) else z
@@ -597,6 +662,102 @@ class OpenH3RegenFastVAEDecode:
         if out is None:
             return self._native(vae, samples, "out of VRAM")
         return (out,)
+
+
+# ------------------------------------------------------------------ experimental RAM-staged fast H3 VAE decoder
+
+_FAST_VAE_STAGED = {}
+def _fast_vae_staged(path):
+    key = (path, os.path.getmtime(path))
+    if key not in _FAST_VAE_STAGED:
+        _FAST_VAE_STAGED.clear()
+        from comfy.ldm.minimax.vae import LATENTS_MEAN, LATENTS_STD
+        from .fast_vae_decoder import KEEP
+        from .fast_vae_staged import StagedNonCausalViTDecoder
+        model = StagedNonCausalViTDecoder(LATENTS_MEAN, LATENTS_STD, KEEP[24], time_norm=5, heads=32, dim_head=64,
+                                          rope_theta=100.0, rope_dim_ratio=0.75, eps=1e-5, latent_channels=24)
+        model.load_state_dict(comfy.utils.load_torch_file(path, safe_load=True), strict=True)
+        model.eval().requires_grad_(False)
+        _FAST_VAE_STAGED[key] = model
+    return _FAST_VAE_STAGED[key]
+
+
+class OpenH3RegenFastVAEDecodeStaged:
+    @classmethod
+    def INPUT_TYPES(cls):
+        vaes = folder_paths.get_filename_list("vae")
+        return {"required": {
+            "samples": ("LATENT", {"tooltip": "H3 video or AV latent (audio is ignored)."}),
+            "vae_name": (vaes, {"default": _pick(vaes, "fast_h3_vae_noncausal"),
+                                "tooltip": "Dedicated StreamRender-H3 fast decoder Safetensors in models/vae."}),
+            "keep_loaded": ("BOOLEAN", {"default": False, "tooltip": "Keep the experimental decoder on the GPU after decoding."}),
+            "spatial_batch": ("INT", {"default": 8, "min": 2, "max": 8, "step": 2, "tooltip": "Number of 16x16 spatial windows processed together. Use 2 for the proven lower-memory baseline; test 4 for higher throughput."}),
+        }, "optional": {
+            "vae": ("VAE", {"tooltip": "Conventional H3 VAE fallback if the experimental decoder runs out of VRAM."}),
+        }}
+
+    # The second output is a normal ComfyUI STRING socket. Connect it to a
+    # text-display node to inspect the report without searching the console.
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "diagnostics")
+    FUNCTION = "decode"
+    CATEGORY = CATEGORY
+    DESCRIPTION = ("EXPERIMENTAL RAM-staged StreamRender-H3 decoder. Spatial batch controls GPU micro-batching; "
+                   "2 is the established baseline and 4 is the next throughput experiment. The diagnostics STRING output contains "
+                   "timings and memory measurements for this execution.")
+
+    def decode(self, samples, vae_name, keep_loaded, spatial_batch, vae=None):
+        wall_started = time.perf_counter()
+        model = _fast_vae_staged(folder_paths.get_full_path_or_raise("vae", vae_name))
+        model.spatial_batch = int(spatial_batch)
+        z = samples["samples"]
+        z = z.tensors[0] if _nested(z) else z
+        if z.ndim != 5 or z.shape[1] != 24:
+            raise ValueError(f"expected an H3 video latent [B, 24, T, H, W], got {tuple(z.shape)}")
+        device = comfy.model_management.get_torch_device()
+        B, _, T, lat_h, lat_w = z.shape
+        frames = 4 * T - 3 * ((T + 4) // 5)
+        out = torch.empty(B * frames, lat_h * 16, lat_w * 16, 3, device=comfy.model_management.intermediate_device())
+        mean = torch.tensor((.485, .456, .406), device=device).view(1, 3, 1, 1, 1)
+        std = torch.tensor((.229, .224, .225), device=device).view(1, 3, 1, 1, 1)
+        batch_reports = []
+        fallback_reason = None
+        try:
+            model.to(device)
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+            with torch.inference_mode(), torch.autocast(device.type, dtype=torch.bfloat16):
+                for b in range(B):
+                    def sink(f, pixels, base=b * frames):
+                        part = (pixels * std + mean).clamp_(0, 1)[0].permute(1, 2, 3, 0)
+                        out[base + f:base + f + part.shape[0]].copy_(part)
+                    model(z[b:b + 1].to(device, torch.float32).transpose(1, 2), sink=sink)
+                    batch_reports.append(getattr(model, "last_decode_report", f"batch {b + 1}: decoder did not provide a report"))
+        except torch.OutOfMemoryError:
+            fallback_reason = "experimental staged fast H3 decoder ran out of VRAM"
+            if vae is None:
+                raise RuntimeError(f"{fallback_reason}; connect the conventional H3 video VAE to use the fallback") from None
+            out = None
+        finally:
+            if not keep_loaded:
+                model.to(comfy.model_management.unet_offload_device())
+            comfy.model_management.soft_empty_cache()
+
+        if out is None:
+            fallback_started = time.perf_counter()
+            images = vae.decode(samples["samples"])
+            images = images.reshape(-1, *images.shape[-3:]) if images.ndim == 5 else images
+            report = ("RAM-staged fast decoder fell back to conventional H3 VAE. "
+                      f"Reason: {fallback_reason}. Conventional VAE fallback time={time.perf_counter() - fallback_started:.2f}s. "
+                      f"Total node time={time.perf_counter() - wall_started:.2f}s.")
+            LOG.warning("Open-H3 staged decoder diagnostics: %s", report)
+            return (images, report)
+
+        report = (f"RAM-staged StreamRender-H3 decode; latent={tuple(z.shape)}; batches={B}; "
+                  f"node_total={time.perf_counter() - wall_started:.2f}s\n" +
+                  "\n".join(f"Batch {i + 1}: {r}" for i, r in enumerate(batch_reports)))
+        LOG.info("Open-H3 staged fast VAE diagnostics output: %s", report.replace("\n", " | "))
+        return (out, report)
 
 
 # ------------------------------------------------------------------ refined latent on disk
@@ -796,10 +957,12 @@ class OpenH3VideoToPrompt:
 
 
 NODE_CLASS_MAPPINGS = {
+    "OpenH3RegenSharpCurves": OpenH3RegenSharpCurves,
     "OpenH3SaveRefinedLatent": OpenH3SaveRefinedLatent,
     "OpenH3LoadRefinedLatent": OpenH3LoadRefinedLatent,
     "OpenH3VideoToPrompt": OpenH3VideoToPrompt,
     "OpenH3RegenFastVAEDecode": OpenH3RegenFastVAEDecode,
+    "OpenH3RegenFastVAEDecodeStaged": OpenH3RegenFastVAEDecodeStaged,
     "OpenH3RegenLora": OpenH3RegenLora,
     "OpenH3RegenSigmas": OpenH3RegenSigmas,
     "OpenH3RegenPrepareDraft": OpenH3RegenPrepareDraft,
@@ -809,10 +972,12 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "OpenH3RegenSharpCurves": "Open-H3 Regenerate - Sharp Curve Branches Only",
     "OpenH3SaveRefinedLatent": "Open-H3 Regenerate · Save Refined Latent",
     "OpenH3LoadRefinedLatent": "Open-H3 Regenerate · Load Refined Latent",
     "OpenH3VideoToPrompt": "Open-H3 · Video to H3 Prompt (inference server)",
     "OpenH3RegenFastVAEDecode": "Open-H3 Regenerate · Fast VAE Decode (StreamRender-H3)",
+    "OpenH3RegenFastVAEDecodeStaged": "Open-H3 Regenerate · Fast VAE Decode (RAM-Staged, Experimental)",
     "OpenH3RegenLora": "Open-H3 Regenerate · LoRA (refiner + Turbo + Sharp)",
     "OpenH3RegenSigmas": "Open-H3 Regenerate · Sigmas",
     "OpenH3RegenPrepareDraft": "Open-H3 Regenerate · Prepare Draft",
